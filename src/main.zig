@@ -39,6 +39,12 @@ const Scanner = struct {
     in_comment: bool = false,
 
     // TODO: cite https://github.com/aclements/biblib
+    //
+    // other links:
+    // https://www.bibtex.org/Format/
+    // https://www.bibtex.org/SpecialSymbols/
+    // https://www.bibtex.com/g/bibtex-format/
+    // https://tug.ctan.org/info/bibtex/tamethebeast/ttb_en.pdf
 
     fn init() Self {
         return Self{};
@@ -63,20 +69,27 @@ const Scanner = struct {
         pre_value,
         value_quoted,
         value_braced,
-        post_member,
+        post_value,
     };
 
     const Error = error{ SyntaxError, UnexpectedEndOfInput, UnexpectedChar };
     const NextError = Error || error{BufferUnderrun};
 
     const Token = union(enum) {
-        part_type: []const u8,
-        part_key: []const u8,
-        end_key_no_value,
-        end_key_with_value,
-        part_value: []const u8,
-        end_value,
-        end,
+        entry_begin,
+        type_begin,
+        type_partial: []const u8,
+        type_end,
+        key_begin,
+        key_partial: []const u8,
+        key_end,
+        key_and_entry_end,
+        value_begin,
+        value_partial: []const u8,
+        value_end,
+        value_and_entry_end,
+        entry_end,
+        end_document,
     };
 
     /// Feeds the scanner with more input.
@@ -111,11 +124,11 @@ const Scanner = struct {
         while (true) {
             switch (self.state) {
                 .none => {
-                    switch (try self.skip_to_maybe_byte() orelse return .end) {
+                    switch (try self.skip_to_maybe_byte() orelse return .end_document) {
                         '@' => {
                             self.cursor += 1;
                             self.state = .saw_at;
-                            continue;
+                            return .entry_begin;
                         },
                         else => return error.UnexpectedChar,
                     }
@@ -126,13 +139,15 @@ const Scanner = struct {
                         return error.UnexpectedChar;
                     }
                     self.state = .entry_type;
-                    continue;
+                    return .type_begin;
                 },
 
                 // TODO: will need to handle comment or string set.
                 // one approach: have a static array that can store
                 // max(len("comment"), len("string")), dispatch on that,
                 // don't return partial until we're sure it's neither.
+                //
+                // will need to move `.type_begin` further down.
 
                 .entry_type => {
                     const i = self.cursor;
@@ -151,7 +166,7 @@ const Scanner = struct {
                     if (i == self.cursor) {
                         return error.BufferUnderrun;
                     }
-                    return Token{ .part_type = self.input[i..self.cursor] };
+                    return Token{ .type_partial = self.input[i..self.cursor] };
                 },
 
                 .entry_post_type => {
@@ -159,7 +174,7 @@ const Scanner = struct {
                         '{' => {
                             self.cursor += 1;
                             self.state = .pre_key;
-                            continue;
+                            return .type_end;
                         },
                         else => return error.UnexpectedChar,
                     }
@@ -174,7 +189,7 @@ const Scanner = struct {
                         },
                         '0'...'9', 'a'...'z', 'A'...'Z', '_' => {
                             self.state = .key;
-                            continue;
+                            return .key_begin;
                         },
                         else => {
                             return error.UnexpectedChar;
@@ -199,7 +214,7 @@ const Scanner = struct {
                     if (i == self.cursor) {
                         return error.BufferUnderrun;
                     }
-                    return Token{ .part_key = self.input[i..self.cursor] };
+                    return Token{ .key_partial = self.input[i..self.cursor] };
                 },
 
                 .post_key => {
@@ -207,19 +222,15 @@ const Scanner = struct {
                         ',' => {
                             self.cursor += 1;
                             self.state = .pre_key;
-                            @panic("TODO");
+                            return .key_end;
                         },
                         '}' => {
                             self.cursor += 1;
                             self.state = .none;
-                            @panic("TODO");
+                            return .key_and_entry_end;
                         },
                         '=' => {
                             self.cursor += 1;
-                            self.state = .pre_value;
-                            continue;
-                        },
-                        ' ', '\n', '\t', '\r', '%' => {
                             self.state = .pre_value;
                             continue;
                         },
@@ -232,12 +243,12 @@ const Scanner = struct {
                         '"' => {
                             self.cursor += 1;
                             self.state = .value_quoted;
-                            continue;
+                            return .value_begin;
                         },
                         '{' => {
                             self.cursor += 1;
                             self.state = .value_braced;
-                            continue;
+                            return .value_begin;
                         },
                         else => {
                             // TODO: handle variables
@@ -246,15 +257,74 @@ const Scanner = struct {
                     }
                 },
 
+                // TODO: handle sub-braces. will need to track depth.
+                // TODO: checking if characters are valid?
+                // TODO: is there \" escaping involved?
+
                 .value_quoted => {
-                    @panic("TODO");
+                    const i = self.cursor;
+                    while (self.cursor < self.input.len) : (self.cursor += 1) {
+                        switch (self.input[self.cursor]) {
+                            '"' => {
+                                self.state = .post_value;
+                                break;
+                            },
+                            '{' => {
+                                @panic("TODO");
+                            },
+                            '}' => {
+                                @panic("TODO");
+                            },
+                            else => continue,
+                        }
+                    }
+                    if (i == self.cursor) {
+                        return error.BufferUnderrun;
+                    }
+                    const j = self.cursor;
+                    self.cursor += 1;
+                    return Token{ .value_partial = self.input[i..j] };
                 },
 
                 .value_braced => {
-                    @panic("TODO");
+                    const i = self.cursor;
+                    while (self.cursor < self.input.len) : (self.cursor += 1) {
+                        switch (self.input[self.cursor]) {
+                            '}' => {
+                                // TODO: stack
+                                self.state = .post_value;
+                                break;
+                            },
+                            '{' => {
+                                @panic("TODO");
+                            },
+                            else => continue,
+                        }
+                    }
+                    if (i == self.cursor) {
+                        return error.BufferUnderrun;
+                    }
+                    // skip closing brace
+                    const j = self.cursor;
+                    self.cursor += 1;
+                    return Token{ .value_partial = self.input[i..j] };
                 },
 
-                else => @panic("TODO"),
+                .post_value => {
+                    switch (try self.skip_to_byte()) {
+                        ',' => {
+                            self.cursor += 1;
+                            self.state = .pre_key;
+                            return .value_end;
+                        },
+                        '}' => {
+                            self.cursor += 1;
+                            self.state = .none;
+                            return .value_and_entry_end;
+                        },
+                        else => return error.UnexpectedChar,
+                    }
+                },
             }
         }
     }
@@ -318,173 +388,6 @@ const Scanner = struct {
     }
 };
 
-fn skipws(str: *[]const u8) void {
-    for (str.*, 0..) |c, i| {
-        if (!ascii.isWhitespace(c)) {
-            str.* = str.*[i..];
-            return;
-        }
-    }
-    str.* = str.*[str.*.len..];
-}
-
-/// Parses an ascii encoded word.
-fn parse_word(str: *[]const u8) ![]const u8 {
-    const s = str.*;
-
-    if (s.len == 0) {
-        return error.UnexpectedEnd;
-    }
-
-    if (!ascii.isAlphabetic(s[0])) {
-        return error.InvalidWord;
-    }
-
-    for (s[1..], 1..) |c, i| {
-        if (!ascii.isAlphabetic(c) and !ascii.isDigit(c)) {
-            str.* = str.*[i..];
-            return s[0..i];
-        }
-    }
-
-    return s[0..s.len];
-}
-
-// TODO: handle nested braces, ", numbers, variables, everything else.
-fn parse_str(str: *[]const u8) ![]const u8 {
-    const s = str.*;
-    if (s.len == 0) {
-        return error.UnexpectedEnd;
-    }
-
-    if (s[0] == '{') {
-        if (s.len == 1) {
-            return error.UnexpectedEnd;
-        }
-
-        for (s[1..], 1..) |c, i| {
-            if (c == '}') {
-                str.* = str.*[i + 1 ..];
-                return s[1..i];
-            }
-        }
-
-        return error.UnclosedBrace;
-    }
-
-    return error.UnexpectedChar;
-}
-
-// Consumes `<tag> = <value?> <,>?`
-fn parse_tag_value(str: *[]const u8) !struct { tag: []const u8, value: ?[]const u8 } {
-    const tag = try parse_word(str);
-    skipws(str);
-
-    if (str.*.len == 0) {
-        return error.UnexpectedEnd;
-    }
-
-    if (str.*[0] == ',' or str.*[0] == '}') {
-        return .{ .tag = tag, .value = null };
-    }
-
-    if (str.*[0] != '=') {
-        return error.UnexpectedChar;
-    }
-
-    str.* = str.*[1..];
-    skipws(str);
-
-    if (str.*.len == 0) {
-        return error.UnexpectedEnd;
-    }
-
-    const value = try parse_str(str);
-
-    skipws(str);
-
-    if (str.*.len == 0) {
-        return error.UnexpectedEnd;
-    }
-
-    if (str.*[0] == '}') {
-        // zig fmt r u ok
-    } else if (str.*[0] == ',') {
-        str.* = str.*[1..];
-    } else {
-        return error.UnexpectedChar;
-    }
-
-    return .{ .tag = tag, .value = value };
-}
-
-fn parse_entry(alloc: std.mem.Allocator, str: *[]const u8) !Entry {
-    if (str.*.len == 0) {
-        return error.UnexpectedEnd;
-    }
-
-    if (str.*[0] != '@') {
-        return error.MissingAt;
-    }
-
-    str.* = str.*[1..];
-    skipws(str);
-    const key = try parse_word(str);
-    skipws(str);
-
-    if (str.*.len == 0) {
-        return error.UnexpectedEnd;
-    }
-
-    if (str.*[0] != '{') {
-        return error.MissingBrace;
-    }
-
-    str.* = str.*[1..];
-    var entry = Entry.init(alloc, key);
-    errdefer entry.deinit();
-
-    skipws(str);
-    while (str.*.len > 0) {
-        const tag_value = try parse_tag_value(str);
-        try entry.push(tag_value.tag, tag_value.value);
-
-        skipws(str);
-
-        if (str.*.len == 0) {
-            return error.UnexpectedEnd;
-        }
-
-        if (str.*[0] == '}') {
-            str.* = str.*[1..];
-            break;
-        }
-    }
-
-    return entry;
-}
-
-fn parse(alloc: std.mem.Allocator, s: []const u8) !std.ArrayList(Entry) {
-    var str: []const u8 = s;
-    var entries = std.ArrayList(Entry).init(alloc);
-
-    errdefer {
-        for (entries.items) |*entry| {
-            entry.deinit();
-        }
-        entries.deinit();
-    }
-
-    skipws(&str);
-    while (str.len > 0) {
-        const entry = try parse_entry(alloc, &str);
-        entries.append(entry) catch return error.Alloc;
-        skipws(&str);
-    }
-
-    return entries;
-}
-
 const Entry = struct {
     const Pair = struct {
         key: []const u8,
@@ -528,80 +431,29 @@ const Entry = struct {
     }
 };
 
-// > The tag's name is not case-sensitive
-//
-// > There is a set of standard-tags existing, which can
-// > be interpreted by BibTeX or third-party tools. Those
-// > which are unknown are ignored by BibTeX, thus can be
-// > used to store additional information without interfering
-// > with the final outcome of a document.
-//
-// @ -> to lower single word -> { -> (to lower key = {text} or "text"),? -> }
-//
-// https://www.bibtex.org/Format/
-// https://www.bibtex.org/SpecialSymbols/
-//
-// not official?
-// https://www.bibtex.com/g/bibtex-format/
-// https://tug.ctan.org/info/bibtex/tamethebeast/ttb_en.pdf
-//
-// some normalizations to do
-// - enforce utf8
-// - indentation
-// - lowercase
-// - line endings, last line empty
-// - check keys are ascii
-//
-// TODO: fuzzing
-// TODO: use reader
-
 test "it fucking works" {
     const test_str =
         \\@article{
-        // \\  title = "A new method for the determination of the pressure of gases",
+        \\  title = "A new method for the determination of the pressure of gases",
         \\  author = {A. N. Other},
         \\  journal = {The Journal of Chemical Physics},
         \\  volume={81},
         \\  number={10},
-        // \\  pages={1000--1001},
-        // \\  year = 1955,
+        \\  pages={1000--1001},
+        \\  year = {1955},
         \\  publisher={American Chemical Society}
         \\}
     ;
-
-    const eql = std.mem.eql;
-    const entries = try parse(std.testing.allocator, test_str);
-
-    defer {
-        for (entries.items) |*entry| {
-            entry.deinit();
-        }
-        entries.deinit();
-    }
-
-    assert(entries.items.len == 1);
-    const entry = entries.items[0];
-
-    assert(eql(u8, entry.typ, "article"));
-    assert(entry.elems.items.len == 5);
-
-    assert(eql(u8, entry.elems.items[0].key, "author"));
-    assert(eql(u8, entry.elems.items[0].value.?, "A. N. Other"));
-    assert(eql(u8, entry.elems.items[1].key, "journal"));
-    assert(eql(u8, entry.elems.items[1].value.?, "The Journal of Chemical Physics"));
-    assert(eql(u8, entry.elems.items[2].key, "volume"));
-    assert(eql(u8, entry.elems.items[2].value.?, "81"));
-    assert(eql(u8, entry.elems.items[3].key, "number"));
-    assert(eql(u8, entry.elems.items[3].value.?, "10"));
-    assert(eql(u8, entry.elems.items[4].key, "publisher"));
-    assert(eql(u8, entry.elems.items[4].value.?, "American Chemical Society"));
 
     var scan = Scanner.init();
     scan.feed(test_str);
     scan.end_input();
     while (true) {
         switch (try scan.next()) {
-            .end => break,
+            .type_partial => |t| std.debug.print("{s}\n", .{t}),
+            .key_partial => |t| std.debug.print("{s}\n", .{t}),
+            .value_partial => |t| std.debug.print("{s}\n", .{t}),
+            .end_document => break,
             else => |c| std.debug.print("{any}\n", .{c}),
         }
     }
