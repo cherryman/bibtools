@@ -65,9 +65,9 @@ const Scanner = struct {
         // comment,
         // string_set,
         // entry_members,
-        pre_key,
-        key,
-        post_key,
+        pre_tag,
+        tag,
+        post_tag,
         pre_value,
         value_quoted,
         value_braced,
@@ -82,11 +82,11 @@ const Scanner = struct {
         type_begin,
         type_partial: []const u8,
         type_end,
-        key_begin,
-        key_partial: []const u8,
-        key_end_no_value,
-        key_and_entry_end,
-        key_end,
+        tag_begin,
+        tag_partial: []const u8,
+        tag_end_no_value,
+        tag_and_entry_end,
+        tag_end,
         value_begin,
         value_partial: []const u8,
         value_end,
@@ -117,8 +117,8 @@ const Scanner = struct {
     // TODO: utf8 validation
     // TODO: utf8 bom
     // TODO: all possible chars in idents
-    // TODO: duplicate keys
-    // TODO: lowercase keys
+    // TODO: duplicate tags
+    // TODO: lowercase tags
     // TODO: early input handling
     // TODO: max lengths for idents
     // TODO: parentheses
@@ -158,7 +158,7 @@ const Scanner = struct {
                     const i = self.cursor;
                     while (self.cursor < self.input.len) : (self.cursor += 1) {
                         switch (self.input[self.cursor]) {
-                            '0'...'9', 'a'...'z', 'A'...'Z', '_' => {
+                            '0'...'9', 'a'...'z', 'A'...'Z', '_', '-', ':' => {
                                 continue;
                             },
                             '{', ' ', '\n', '\t', '\r', '%' => {
@@ -178,14 +178,14 @@ const Scanner = struct {
                     switch (try self.skip_to_byte()) {
                         '{' => {
                             self.cursor += 1;
-                            self.state = .pre_key;
+                            self.state = .pre_tag;
                             return .type_end;
                         },
                         else => return error.SyntaxError,
                     }
                 },
 
-                .pre_key => {
+                .pre_tag => {
                     switch (try self.skip_to_byte()) {
                         '}' => {
                             self.cursor += 1;
@@ -193,8 +193,8 @@ const Scanner = struct {
                             return .entry_end;
                         },
                         '0'...'9', 'a'...'z', 'A'...'Z', '_' => {
-                            self.state = .key;
-                            return .key_begin;
+                            self.state = .tag;
+                            return .tag_begin;
                         },
                         else => {
                             return error.SyntaxError;
@@ -202,8 +202,8 @@ const Scanner = struct {
                     }
                 },
 
-                .key => {
-                    // case should only be hit if we're at the start of a key.
+                .tag => {
+                    // case should only be hit if we're at the start of a tag.
                     const i = self.cursor;
                     while (self.cursor < self.input.len) : (self.cursor += 1) {
                         switch (self.input[self.cursor]) {
@@ -211,7 +211,7 @@ const Scanner = struct {
                                 continue;
                             },
                             else => {
-                                self.state = .post_key;
+                                self.state = .post_tag;
                                 break;
                             },
                         }
@@ -219,25 +219,25 @@ const Scanner = struct {
                     if (i == self.cursor) {
                         return error.BufferUnderrun;
                     }
-                    return Token{ .key_partial = self.input[i..self.cursor] };
+                    return Token{ .tag_partial = self.input[i..self.cursor] };
                 },
 
-                .post_key => {
+                .post_tag => {
                     switch (try self.skip_to_byte()) {
                         ',' => {
                             self.cursor += 1;
-                            self.state = .pre_key;
-                            return .key_end_no_value;
+                            self.state = .pre_tag;
+                            return .tag_end_no_value;
                         },
                         '}' => {
                             self.cursor += 1;
                             self.state = .none;
-                            return .key_and_entry_end;
+                            return .tag_and_entry_end;
                         },
                         '=' => {
                             self.cursor += 1;
                             self.state = .pre_value;
-                            return .key_end;
+                            return .tag_end;
                         },
                         else => return error.SyntaxError,
                     }
@@ -333,7 +333,7 @@ const Scanner = struct {
                     switch (try self.skip_to_byte()) {
                         ',' => {
                             self.cursor += 1;
-                            self.state = .pre_key;
+                            self.state = .pre_tag;
                             return .value_end;
                         },
                         '}' => {
@@ -479,30 +479,30 @@ pub fn Reader(comptime buf_size: usize, comptime ReaderType: type) type {
 
             while (true) {
                 switch (try self.next_scanner_token()) {
-                    .key_begin => {},
+                    .tag_begin => {},
                     .entry_end => break,
                     else => unreachable,
                 }
 
-                var key = try String.initCapacity(alloc, 16);
-                var key_tok = try self.next_scanner_token();
-                defer key.deinit();
+                var tag = try String.initCapacity(alloc, 16);
+                var tag_tok = try self.next_scanner_token();
+                defer tag.deinit();
 
-                while (key_tok == .key_partial) {
-                    try key.appendSlice(key_tok.key_partial);
-                    key_tok = try self.next_scanner_token();
+                while (tag_tok == .tag_partial) {
+                    try tag.appendSlice(tag_tok.tag_partial);
+                    tag_tok = try self.next_scanner_token();
                 }
 
-                key.shrinkAndFree(key.items.len);
+                tag.shrinkAndFree(tag.items.len);
 
-                switch (key_tok) {
-                    .key_end => {},
-                    .key_end_no_value => {
-                        try entry.push(key.items, null);
+                switch (tag_tok) {
+                    .tag_end => {},
+                    .tag_end_no_value => {
+                        try entry.push(tag.items, null);
                         continue;
                     },
-                    .key_and_entry_end => {
-                        try entry.push(key.items, null);
+                    .tag_and_entry_end => {
+                        try entry.push(tag.items, null);
                         break;
                     },
                     else => unreachable,
@@ -519,7 +519,7 @@ pub fn Reader(comptime buf_size: usize, comptime ReaderType: type) type {
                 }
 
                 value.shrinkAndFree(value.items.len);
-                try entry.push(key.items, value.items);
+                try entry.push(tag.items, value.items);
 
                 switch (value_tok) {
                     .value_end => continue,
@@ -535,7 +535,7 @@ pub fn Reader(comptime buf_size: usize, comptime ReaderType: type) type {
 
 const Entry = struct {
     const Pair = struct {
-        key: []const u8,
+        tag: []const u8,
         value: ?[]const u8,
     };
 
@@ -557,18 +557,18 @@ const Entry = struct {
         };
     }
 
-    fn push(self: *Self, key: []const u8, value: ?[]const u8) !void {
-        const key_ = try self.alloc.dupe(u8, key);
+    fn push(self: *Self, tag: []const u8, value: ?[]const u8) !void {
+        const tag_ = try self.alloc.dupe(u8, tag);
         var value_: ?[]const u8 = null;
         if (value) |v| {
             value_ = try self.alloc.dupe(u8, v);
         }
-        try self.elems.append(.{ .key = key_, .value = value_ });
+        try self.elems.append(.{ .tag = tag_, .value = value_ });
     }
 
     fn deinit(self: *Self) void {
         for (self.elems.items) |pair| {
-            self.alloc.free(pair.key);
+            self.alloc.free(pair.tag);
             if (pair.value) |v| {
                 self.alloc.free(v);
             }
@@ -584,7 +584,7 @@ const Entry = struct {
 
         for (self.elems.items) |pair| {
             try writer.writeAll("  ");
-            try writer.writeAll(pair.key);
+            try writer.writeAll(pair.tag);
             if (pair.value) |v| {
                 try writer.writeAll(" = ");
                 try writer.writeAll("{");
@@ -602,6 +602,7 @@ const Entry = struct {
 test "it fucking works" {
     const test_str =
         \\@article{
+        \\  other_new_1955,
         \\  % comment
         \\  title = "A new method for the determination of the pressure of gases",
         \\  author = {A. N. Other},
@@ -621,7 +622,7 @@ test "it fucking works" {
     while (true) {
         switch (try scan.next()) {
             .type_partial => |t| std.debug.print("{s}\n", .{t}),
-            .key_partial => |t| std.debug.print("{s}\n", .{t}),
+            .tag_partial => |t| std.debug.print("{s}\n", .{t}),
             .value_partial => |t| std.debug.print("{s}\n", .{t}),
             .end_document => break,
             else => |c| std.debug.print("{any}\n", .{c}),
