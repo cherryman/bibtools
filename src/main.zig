@@ -84,8 +84,6 @@ const Scanner = struct {
         type_end,
         tag_begin,
         tag_partial: []const u8,
-        tag_end_no_value,
-        tag_and_entry_end,
         tag_end,
         value_begin,
         value_partial: []const u8,
@@ -224,16 +222,6 @@ const Scanner = struct {
 
                 .post_tag => {
                     switch (try self.skip_to_byte()) {
-                        ',' => {
-                            self.cursor += 1;
-                            self.state = .pre_tag;
-                            return .tag_end_no_value;
-                        },
-                        '}' => {
-                            self.cursor += 1;
-                            self.state = .none;
-                            return .tag_and_entry_end;
-                        },
                         '=' => {
                             self.cursor += 1;
                             self.state = .pre_value;
@@ -494,21 +482,9 @@ pub fn Reader(comptime buf_size: usize, comptime ReaderType: type) type {
                 }
 
                 tag.shrinkAndFree(tag.items.len);
-
-                switch (tag_tok) {
-                    .tag_end => {},
-                    .tag_end_no_value => {
-                        try entry.push(tag.items, null);
-                        continue;
-                    },
-                    .tag_and_entry_end => {
-                        try entry.push(tag.items, null);
-                        break;
-                    },
-                    else => unreachable,
-                }
-
+                assert(tag_tok == .tag_end);
                 assert(try self.next_scanner_token() == .value_begin);
+
                 var value = try String.initCapacity(alloc, 16);
                 var value_tok = try self.next_scanner_token();
                 defer value.deinit();
@@ -536,7 +512,7 @@ pub fn Reader(comptime buf_size: usize, comptime ReaderType: type) type {
 const Entry = struct {
     const Pair = struct {
         tag: []const u8,
-        value: ?[]const u8,
+        value: []const u8,
     };
 
     alloc: std.mem.Allocator,
@@ -557,21 +533,16 @@ const Entry = struct {
         };
     }
 
-    fn push(self: *Self, tag: []const u8, value: ?[]const u8) !void {
+    fn push(self: *Self, tag: []const u8, value: []const u8) !void {
         const tag_ = try self.alloc.dupe(u8, tag);
-        var value_: ?[]const u8 = null;
-        if (value) |v| {
-            value_ = try self.alloc.dupe(u8, v);
-        }
+        const value_ = try self.alloc.dupe(u8, value);
         try self.elems.append(.{ .tag = tag_, .value = value_ });
     }
 
     fn deinit(self: *Self) void {
         for (self.elems.items) |pair| {
             self.alloc.free(pair.tag);
-            if (pair.value) |v| {
-                self.alloc.free(v);
-            }
+            self.alloc.free(pair.value);
         }
         self.elems.deinit();
         self.alloc.free(self.typ);
@@ -585,14 +556,10 @@ const Entry = struct {
         for (self.elems.items) |pair| {
             try writer.writeAll("  ");
             try writer.writeAll(pair.tag);
-            if (pair.value) |v| {
-                try writer.writeAll(" = ");
-                try writer.writeAll("{");
-                try writer.writeAll(v);
-                try writer.writeAll("},\n");
-            } else {
-                try writer.writeAll(",\n");
-            }
+            try writer.writeAll(" = ");
+            try writer.writeAll("{");
+            try writer.writeAll(pair.value);
+            try writer.writeAll("},\n");
         }
 
         try writer.writeAll("}\n");
@@ -602,7 +569,8 @@ const Entry = struct {
 test "it fucking works" {
     const test_str =
         \\@article{
-        \\  other_new_1955,
+        // TODO: uncomment when citation keys are added.
+        // \\  other_new_1955,
         \\  % comment
         \\  title = "A new method for the determination of the pressure of gases",
         \\  author = {A. N. Other},
