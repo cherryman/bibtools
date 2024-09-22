@@ -1,20 +1,21 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const ascii = std.ascii;
+const Allocator = std.mem.Allocator;
 
 pub fn main() !void {
-    // Prints to stderr (it's a shortcut based on `std.io.getStdErr()`)
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+    const stdin = std.io.getStdIn().reader();
+    var stdout = std.io.getStdOut().writer();
+    var reader = Reader(1024, @TypeOf(stdin)).init(stdin);
+    var entries = try reader.parse_all(std.heap.page_allocator);
 
-    // stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    const stdout_file = std.io.getStdOut().writer();
-    var bw = std.io.bufferedWriter(stdout_file);
-    const stdout = bw.writer();
+    for (entries.items) |*entry| {
+        try entry.pretty_print(stdout);
+        try stdout.writeAll("\n");
+        entry.deinit();
+    }
 
-    try stdout.print("Run `zig build test` to run the tests.\n", .{});
-    try bw.flush(); // don't forget to flush!
+    entries.deinit();
 }
 
 /// Modelled after [`std.json.Scanner`] as it's idiomatic and is
@@ -72,7 +73,7 @@ const Scanner = struct {
         post_value,
     };
 
-    const Error = error{ SyntaxError, UnexpectedEndOfInput, UnexpectedChar };
+    const Error = error{ SyntaxError, UnexpectedEndOfInput };
     const NextError = Error || error{BufferUnderrun};
 
     const Token = union(enum) {
@@ -82,8 +83,9 @@ const Scanner = struct {
         type_end,
         key_begin,
         key_partial: []const u8,
-        key_end,
+        key_end_no_value,
         key_and_entry_end,
+        key_end,
         value_begin,
         value_partial: []const u8,
         value_end,
@@ -119,6 +121,8 @@ const Scanner = struct {
     // TODO: early input handling
     // TODO: max lengths for idents
     // TODO: parentheses
+    // TODO: trim values?
+    // TODO: add line breaks to values?
 
     pub fn next(self: *Self) NextError!Token {
         while (true) {
@@ -130,13 +134,13 @@ const Scanner = struct {
                             self.state = .saw_at;
                             return .entry_begin;
                         },
-                        else => return error.UnexpectedChar,
+                        else => return error.SyntaxError,
                     }
                 },
 
                 .saw_at => {
                     if (try self.skip_to_byte() == '{') {
-                        return error.UnexpectedChar;
+                        return error.SyntaxError;
                     }
                     self.state = .entry_type;
                     return .type_begin;
@@ -160,7 +164,7 @@ const Scanner = struct {
                                 self.state = .entry_post_type;
                                 break;
                             },
-                            else => return error.UnexpectedChar,
+                            else => return error.SyntaxError,
                         }
                     }
                     if (i == self.cursor) {
@@ -176,7 +180,7 @@ const Scanner = struct {
                             self.state = .pre_key;
                             return .type_end;
                         },
-                        else => return error.UnexpectedChar,
+                        else => return error.SyntaxError,
                     }
                 },
 
@@ -192,7 +196,7 @@ const Scanner = struct {
                             return .key_begin;
                         },
                         else => {
-                            return error.UnexpectedChar;
+                            return error.SyntaxError;
                         },
                     }
                 },
@@ -222,7 +226,7 @@ const Scanner = struct {
                         ',' => {
                             self.cursor += 1;
                             self.state = .pre_key;
-                            return .key_end;
+                            return .key_end_no_value;
                         },
                         '}' => {
                             self.cursor += 1;
@@ -232,9 +236,9 @@ const Scanner = struct {
                         '=' => {
                             self.cursor += 1;
                             self.state = .pre_value;
-                            continue;
+                            return .key_end;
                         },
-                        else => return error.UnexpectedChar,
+                        else => return error.SyntaxError,
                     }
                 },
 
@@ -252,7 +256,7 @@ const Scanner = struct {
                         },
                         else => {
                             // TODO: handle variables
-                            return error.UnexpectedChar;
+                            return error.SyntaxError;
                         },
                     }
                 },
@@ -322,7 +326,7 @@ const Scanner = struct {
                             self.state = .none;
                             return .value_and_entry_end;
                         },
-                        else => return error.UnexpectedChar,
+                        else => return error.SyntaxError,
                     }
                 },
             }
@@ -380,13 +384,139 @@ const Scanner = struct {
                     self.line_number += 1;
                     self.line_start_cursor = self.cursor;
                     self.in_comment = false;
-                    continue;
+                    break;
                 },
                 else => continue,
             }
         }
     }
 };
+
+/// Wrapper around a reader that scans and produces entries.
+pub fn Reader(comptime buf_size: usize, comptime ReaderType: type) type {
+    return struct {
+        buf: [buf_size]u8 = undefined,
+        scanner: Scanner = Scanner.init(),
+        reader: ReaderType,
+
+        pub const Error = ReaderType.Error || Scanner.Error || Allocator.Error;
+
+        pub fn init(reader: ReaderType) @This() {
+            return @This(){ .reader = reader };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            // TODO: close reader?
+            self.scanner.deinit();
+            self.* = undefined;
+        }
+
+        pub fn parse_all(self: *@This(), alloc: Allocator) Error!std.ArrayList(Entry) {
+            var entries = std.ArrayList(Entry).init(alloc);
+            errdefer entries.deinit();
+            while (try self.next_entry(alloc)) |entry| {
+                try entries.append(entry);
+            }
+            return entries;
+        }
+
+        fn next_scanner_token(self: *@This()) Error!Scanner.Token {
+            while (true) {
+                return self.scanner.next() catch |err| switch (err) {
+                    error.BufferUnderrun => {
+                        const n = try self.reader.read(self.buf[0..]);
+                        if (n == 0) {
+                            self.scanner.end_input();
+                        } else {
+                            self.scanner.feed(self.buf[0..n]);
+                        }
+                        continue;
+                    },
+                    else => |e| return e,
+                };
+            }
+        }
+
+        fn next_entry(self: *@This(), alloc: Allocator) Error!?Entry {
+            const String = std.ArrayList(u8);
+
+            switch (try self.next_scanner_token()) {
+                .entry_begin => {},
+                .end_document => return null,
+                else => unreachable,
+            }
+
+            assert(try self.next_scanner_token() == .type_begin);
+            var typ = try String.initCapacity(alloc, 16);
+
+            while (true) {
+                errdefer typ.deinit();
+                switch (try self.next_scanner_token()) {
+                    .type_partial => |t| try typ.appendSlice(t),
+                    .type_end => break,
+                    else => unreachable,
+                }
+            }
+
+            var entry = Entry.init(alloc, try alloc.dupe(u8, typ.items));
+            typ.deinit();
+            errdefer entry.deinit();
+
+            while (true) {
+                switch (try self.next_scanner_token()) {
+                    .key_begin => {},
+                    .entry_end => break,
+                    else => unreachable,
+                }
+
+                var key = try String.initCapacity(alloc, 16);
+                var key_tok = try self.next_scanner_token();
+                defer key.deinit();
+
+                while (key_tok == .key_partial) {
+                    try key.appendSlice(key_tok.key_partial);
+                    key_tok = try self.next_scanner_token();
+                }
+
+                key.shrinkAndFree(key.items.len);
+
+                switch (key_tok) {
+                    .key_end => {},
+                    .key_end_no_value => {
+                        try entry.push(key.items, null);
+                        continue;
+                    },
+                    .key_and_entry_end => {
+                        try entry.push(key.items, null);
+                        break;
+                    },
+                    else => unreachable,
+                }
+
+                assert(try self.next_scanner_token() == .value_begin);
+                var value = try String.initCapacity(alloc, 16);
+                var value_tok = try self.next_scanner_token();
+                defer value.deinit();
+
+                while (value_tok == .value_partial) {
+                    try value.appendSlice(value_tok.value_partial);
+                    value_tok = try self.next_scanner_token();
+                }
+
+                value.shrinkAndFree(value.items.len);
+                try entry.push(key.items, value.items);
+
+                switch (value_tok) {
+                    .value_end => continue,
+                    .value_and_entry_end => break,
+                    else => unreachable,
+                }
+            }
+
+            return entry;
+        }
+    };
+}
 
 const Entry = struct {
     const Pair = struct {
@@ -400,6 +530,7 @@ const Entry = struct {
 
     const Self = @This();
 
+    /// Creates a new entry. `typ` is owned and must be allocated with `alloc`.
     fn init(
         alloc: std.mem.Allocator,
         typ: []const u8,
@@ -428,20 +559,44 @@ const Entry = struct {
             }
         }
         self.elems.deinit();
+        self.alloc.free(self.typ);
+    }
+
+    fn pretty_print(self: *const Self, writer: anytype) @TypeOf(writer).Error!void {
+        try writer.writeAll("@");
+        try writer.writeAll(self.typ);
+        try writer.writeAll("{\n");
+
+        for (self.elems.items) |pair| {
+            try writer.writeAll("  ");
+            try writer.writeAll(pair.key);
+            if (pair.value) |v| {
+                try writer.writeAll(" = ");
+                try writer.writeAll("{");
+                try writer.writeAll(v);
+                try writer.writeAll("},\n");
+            } else {
+                try writer.writeAll(",\n");
+            }
+        }
+
+        try writer.writeAll("}\n");
     }
 };
 
 test "it fucking works" {
     const test_str =
         \\@article{
+        \\  % comment
         \\  title = "A new method for the determination of the pressure of gases",
         \\  author = {A. N. Other},
         \\  journal = {The Journal of Chemical Physics},
         \\  volume={81},
         \\  number={10},
         \\  pages={1000--1001},
-        \\  year = {1955},
+        \\  year = "1955",
         \\  publisher={American Chemical Society}
+        \\  % comment
         \\}
     ;
 
@@ -456,5 +611,20 @@ test "it fucking works" {
             .end_document => break,
             else => |c| std.debug.print("{any}\n", .{c}),
         }
+    }
+
+    var stream = std.io.fixedBufferStream(test_str);
+    var reader = Reader(1024, @TypeOf(stream.reader())).init(stream.reader());
+
+    var entries = try reader.parse_all(std.testing.allocator);
+    defer {
+        for (entries.items) |*entry| {
+            entry.deinit();
+        }
+        entries.deinit();
+    }
+
+    for (entries.items) |entry| {
+        try entry.pretty_print(std.io.getStdOut().writer());
     }
 }
