@@ -6,12 +6,27 @@ const Allocator = std.mem.Allocator;
 pub fn main() !void {
     const stdin = std.io.getStdIn().reader();
     var stdout = std.io.getStdOut().writer();
-    var reader = Reader(1024, @TypeOf(stdin)).init(stdin);
-    var entries = try reader.parse_all(std.heap.page_allocator);
+    var reader = Reader(65536, @TypeOf(stdin)).init(stdin);
+    var entries = reader.parse_all(std.heap.page_allocator) catch |err| {
+        switch (err) {
+            error.SyntaxError, error.UnexpectedEndOfInput => {
+                std.debug.print("lineno: {d}\n", .{reader.scanner.line_number});
+            },
+            else => {},
+        }
+        return err;
+    };
 
-    for (entries.items) |*entry| {
-        try entry.pretty_print(stdout);
+    if (entries.items.len == 0) {
+        return;
+    }
+
+    try entries.items[0].pretty_print(stdout);
+    entries.items[0].deinit();
+
+    for (entries.items[1..]) |*entry| {
         try stdout.writeAll("\n");
+        try entry.pretty_print(stdout);
         entry.deinit();
     }
 
@@ -65,6 +80,9 @@ const Scanner = struct {
         // comment,
         // string_set,
         // entry_members,
+        pre_key,
+        key,
+        post_key,
         pre_tag,
         tag,
         post_tag,
@@ -81,7 +99,10 @@ const Scanner = struct {
         entry_begin,
         type_begin,
         type_partial: []const u8,
-        type_end,
+        type_end_key_begin,
+        key_partial: []const u8,
+        key_end,
+        key_and_entry_end,
         tag_begin,
         tag_partial: []const u8,
         tag_end,
@@ -176,8 +197,54 @@ const Scanner = struct {
                     switch (try self.skip_to_byte()) {
                         '{' => {
                             self.cursor += 1;
+                            self.state = .pre_key;
+                            return .type_end_key_begin;
+                        },
+                        else => return error.SyntaxError,
+                    }
+                },
+
+                .pre_key => {
+                    switch (try self.skip_to_byte()) {
+                        '0'...'9', 'a'...'z', 'A'...'Z', '_', '-', ':' => {
+                            self.state = .key;
+                            continue;
+                        },
+                        else => return error.SyntaxError,
+                    }
+                },
+
+                .key => {
+                    const i = self.cursor;
+                    while (self.cursor < self.input.len) : (self.cursor += 1) {
+                        switch (self.input[self.cursor]) {
+                            '0'...'9', 'a'...'z', 'A'...'Z', '_', '-', ':' => {
+                                continue;
+                            },
+                            ',', '}' => {
+                                self.state = .post_key;
+                                break;
+                            },
+                            else => return error.SyntaxError,
+                        }
+                    }
+                    if (i == self.cursor) {
+                        return error.BufferUnderrun;
+                    }
+                    return Token{ .key_partial = self.input[i..self.cursor] };
+                },
+
+                .post_key => {
+                    switch (try self.skip_to_byte()) {
+                        ',' => {
+                            self.cursor += 1;
                             self.state = .pre_tag;
-                            return .type_end;
+                            return .key_end;
+                        },
+                        '}' => {
+                            self.cursor += 1;
+                            self.state = .none;
+                            return .key_and_entry_end;
                         },
                         else => return error.SyntaxError,
                     }
@@ -456,13 +523,31 @@ pub fn Reader(comptime buf_size: usize, comptime ReaderType: type) type {
                 errdefer typ.deinit();
                 switch (try self.next_scanner_token()) {
                     .type_partial => |t| try typ.appendSlice(t),
-                    .type_end => break,
+                    .type_end_key_begin => break,
                     else => unreachable,
                 }
             }
 
-            var entry = Entry.init(alloc, try alloc.dupe(u8, typ.items));
+            var key = try String.initCapacity(alloc, 16);
+            const should_return = while (true) {
+                errdefer key.deinit();
+                switch (try self.next_scanner_token()) {
+                    .key_partial => |t| try key.appendSlice(t),
+                    .key_end => break false,
+                    .key_and_entry_end => break true,
+                    else => unreachable,
+                }
+            };
+
+            var entry = Entry.init(alloc, try typ.toOwnedSlice(), try key.toOwnedSlice());
+
             typ.deinit();
+            key.deinit();
+
+            if (should_return) {
+                return entry;
+            }
+
             errdefer entry.deinit();
 
             while (true) {
@@ -517,17 +602,20 @@ const Entry = struct {
 
     alloc: std.mem.Allocator,
     typ: []const u8,
+    key: []const u8,
     elems: std.ArrayList(Pair),
 
     const Self = @This();
 
-    /// Creates a new entry. `typ` is owned and must be allocated with `alloc`.
+    /// Creates a new entry. `typ` and `key` are owned and must be allocated with `alloc`.
     fn init(
         alloc: std.mem.Allocator,
         typ: []const u8,
+        key: []const u8,
     ) Self {
         return Self{
             .typ = typ,
+            .key = key,
             .alloc = alloc,
             .elems = std.ArrayList(Pair).init(alloc),
         };
@@ -546,12 +634,15 @@ const Entry = struct {
         }
         self.elems.deinit();
         self.alloc.free(self.typ);
+        self.alloc.free(self.key);
     }
 
     fn pretty_print(self: *const Self, writer: anytype) @TypeOf(writer).Error!void {
         try writer.writeAll("@");
         try writer.writeAll(self.typ);
-        try writer.writeAll("{\n");
+        try writer.writeAll("{");
+        try writer.writeAll(self.key);
+        try writer.writeAll(",\n");
 
         for (self.elems.items) |pair| {
             try writer.writeAll("  ");
@@ -570,7 +661,7 @@ test "it fucking works" {
     const test_str =
         \\@article{
         // TODO: uncomment when citation keys are added.
-        // \\  other_new_1955,
+        \\  other_new_1955,
         \\  % comment
         \\  title = "A new method for the determination of the pressure of gases",
         \\  author = {A. N. Other},
