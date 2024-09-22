@@ -27,6 +27,10 @@ const Scanner = struct {
     input: []const u8 = "",
     cursor: usize = 0,
     state: State = .none,
+
+    // symbols: std.StringHashMap([]const u8),
+    brace_depth: usize = 0,
+    in_comment: bool = false,
     is_end_of_input: bool = false,
 
     // TODO: taken from `Diagnostics`, need to use
@@ -35,9 +39,6 @@ const Scanner = struct {
     line_start_cursor: usize = 0,
     // total_bytes_before_current_input: usize = 0,
     // cursor_pointer: *const usize = undefined,
-
-    // symbols: std.StringHashMap([]const u8),
-    in_comment: bool = false,
 
     // TODO: cite https://github.com/aclements/biblib
     //
@@ -189,7 +190,7 @@ const Scanner = struct {
                         '}' => {
                             self.cursor += 1;
                             self.state = .none;
-                            @panic("TODO");
+                            return .entry_end;
                         },
                         '0'...'9', 'a'...'z', 'A'...'Z', '_' => {
                             self.state = .key;
@@ -274,10 +275,15 @@ const Scanner = struct {
                                 break;
                             },
                             '{' => {
-                                @panic("TODO");
+                                self.brace_depth += 1;
+                                continue;
                             },
                             '}' => {
-                                @panic("TODO");
+                                if (self.brace_depth == 0) {
+                                    return error.SyntaxError;
+                                }
+                                self.brace_depth -= 1;
+                                continue;
                             },
                             else => continue,
                         }
@@ -295,12 +301,17 @@ const Scanner = struct {
                     while (self.cursor < self.input.len) : (self.cursor += 1) {
                         switch (self.input[self.cursor]) {
                             '}' => {
-                                // TODO: stack
-                                self.state = .post_value;
-                                break;
+                                if (self.brace_depth == 0) {
+                                    self.state = .post_value;
+                                    break;
+                                } else {
+                                    self.brace_depth -= 1;
+                                    continue;
+                                }
                             },
                             '{' => {
-                                @panic("TODO");
+                                self.brace_depth += 1;
+                                continue;
                             },
                             else => continue,
                         }
@@ -315,6 +326,10 @@ const Scanner = struct {
                 },
 
                 .post_value => {
+                    if (self.brace_depth != 0) {
+                        return error.SyntaxError;
+                    }
+
                     switch (try self.skip_to_byte()) {
                         ',' => {
                             self.cursor += 1;
@@ -592,10 +607,10 @@ test "it fucking works" {
         \\  author = {A. N. Other},
         \\  journal = {The Journal of Chemical Physics},
         \\  volume={81},
-        \\  number={10},
-        \\  pages={1000--1001},
+        \\  number={{10}},
+        \\  pages={1000--{1001}},
         \\  year = "1955",
-        \\  publisher={American Chemical Society}
+        \\  publisher="{American {Chemical}} Society"
         \\  % comment
         \\}
     ;
